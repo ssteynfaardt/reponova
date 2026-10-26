@@ -221,6 +221,28 @@ const langCommand: CommandModule = {
   },
 };
 
+const hubCommand: CommandModule = {
+  command: "hub <action> [target]",
+  describe: "Manage the graph hub (named graphs served by one MCP server)",
+  builder: (y) =>
+    y
+      .positional("action", {
+        type: "string",
+        choices: ["add", "import", "build", "list", "remove", "prune"] as const,
+        describe: "add [path] | import <config> --name | build <name> | list | remove <name> | prune",
+      })
+      .positional("target", { type: "string", describe: "Repo path, config path, or graph name" })
+      .option("name", { type: "string", describe: "Graph name (default: <repo> or <repo>@<branch> for worktrees)" })
+      .option("from", { type: "string", describe: "add: copy settings (plugins, excludes) from this reponova.yml" })
+      .option("if-registered", { type: "boolean", describe: "add: no-op unless the repo's main checkout is already in the hub" })
+      .option("build", { type: "boolean", default: true, describe: "add: build after registering (--no-build to skip)" })
+      .option("force", { type: "boolean", describe: "add/build: full rebuild" }),
+  handler: async (argv) => {
+    const { hubHandler } = await import("./hub.js");
+    await hubHandler(argv);
+  },
+};
+
 yargs(hideBin(process.argv))
   .scriptName("reponova")
   .usage("$0 <command> [options]")
@@ -237,6 +259,7 @@ yargs(hideBin(process.argv))
   .command(enrichApplyCommand)
   .command(enrichFinalizeCommand)
   .command(langCommand)
+  .command(hubCommand)
   .demandCommand(1, "Please specify a command")
   .strict()
   .strictCommands()

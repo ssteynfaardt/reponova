@@ -8,6 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { statSync } from "node:fs";
 import { resolveGraphPath, resolveSearchDb, resolveGraphJson } from "../shared/graph-resolver.js";
+import { getHubGraph, graphForCwd, hubDir, listHubGraphs } from "../shared/hub.js";
 import { errorMessage, log } from "../shared/utils.js";
 import type { PathResolver } from "../shared/path-resolver.js";
 import type { Database } from "../query/db.js";
@@ -52,10 +53,26 @@ class ResourceManager {
   }
 
   /**
+   * Resolve the graph dir for a call.
+   * `graph` (hub name or path) wins; then --graph / REPONOVA_GRAPH_PATH; then the hub graph
+   * for the server's cwd (worktree graph, else main checkout); then ./reponova-out + sibling probe.
+   */
+  resolveDir(graph?: string): string | null {
+    if (graph) {
+      if (graph.includes("/")) return resolveGraphPath(graph);
+      const g = getHubGraph(graph);
+      if (!g) throw new Error(`Unknown graph "${graph}". Call graph_list to see available graphs.`);
+      return g.outputDir;
+    }
+    if (this.graphPathHint || process.env["REPONOVA_GRAPH_PATH"]) return resolveGraphPath(this.graphPathHint);
+    return graphForCwd(process.cwd())?.outputDir ?? resolveGraphPath();
+  }
+
+  /**
    * Try initial load. Does NOT throw — if dir missing, server stays idle.
    */
   async tryInitialLoad(): Promise<void> {
-    const graphDir = resolveGraphPath(this.graphPathHint);
+    const graphDir = this.resolveDir();
     if (!graphDir) {
       log.info("Graph output not found — server will load resources on first tool call after build.");
       return;
@@ -71,11 +88,12 @@ class ResourceManager {
   /**
    * Called before every tool call. Returns resources or throws a user-friendly error.
    */
-  async getResources(): Promise<ServerResources> {
+  // ponytail: one graph loaded at a time (similar/context hold module-level state); switching graphs reloads.
+  async getResources(graph?: string): Promise<ServerResources> {
     // Re-resolve graph path each time (handles dir appearing after startup)
-    const graphDir = resolveGraphPath(this.graphPathHint);
+    const graphDir = this.resolveDir(graph);
     if (!graphDir) {
-      throw new Error("Graph output directory not found. Run 'reponova build' first, or pass --graph <path>.");
+      throw new Error("Graph output directory not found. Pass `graph` (see graph_list), run 'reponova hub add', or pass --graph <path>.");
     }
     const graphJsonPath = resolveGraphJson(graphDir);
     if (!graphJsonPath) {
@@ -208,6 +226,24 @@ class ResourceManager {
   }
 }
 
+// ─── Hub ─────────────────────────────────────────────────────────────────────
+
+const GRAPH_ARG = {
+  type: "string",
+  description: "Hub graph name (see graph_list), e.g. 'orca' or 'orca@my-branch'. Default: the graph for the current repo/worktree.",
+};
+
+function listGraphs(resourceManager: ResourceManager) {
+  let current: string | null = null;
+  try { current = resourceManager.resolveDir(); } catch { /* none */ }
+  const graphs = listHubGraphs();
+  const lines = graphs.length
+    ? graphs.map((g) => `${g.outputDir === current ? "* " : "  "}${g.name}${g.built ? "" : " (not built)"} — ${g.repos.join(", ")}`)
+    : [`No graphs in ${hubDir()}. Register one with: reponova hub add <repo-path>`];
+  if (current && !graphs.some((g) => g.outputDir === current)) lines.push(`* (default, outside hub) ${current}`);
+  return { content: [{ type: "text" as const, text: ["## Graphs (* = default for this session)", "", ...lines].join("\n") }] };
+}
+
 // ─── Server Entry Point ──────────────────────────────────────────────────────
 
 export async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
@@ -230,6 +266,8 @@ export async function startMcpServer(options: McpServerOptions = {}): Promise<vo
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
+      { name: "graph_list", description: "List graphs in the reponova hub (one per repo / worktree) and which one is the default for this session. Pass a name as `graph` to any graph_* tool.", inputSchema: { type: "object" as const, properties: {} } },
+      ...[
       { name: "graph_search", description: "Full-text search on knowledge graph nodes with optional BFS/DFS context expansion.", inputSchema: { type: "object" as const, properties: { query: { type: "string", description: "Search text" }, top_k: { type: "number", description: "Max results (default: 10)" }, repo: { type: "string", description: "Filter by repo" }, type: { type: "string", description: "Filter by type: function, class, module, all" }, context_depth: { type: "number", description: "BFS/DFS expansion depth from results (0 = no expansion, default: 0)" }, context_mode: { type: "string", description: "Expansion mode: bfs (broad context) or dfs (trace path). Default: bfs" } }, required: ["query"] } },
       { name: "graph_impact", description: "Blast radius analysis: what depends on a symbol and what it depends on.", inputSchema: { type: "object" as const, properties: { symbol: { type: "string", description: "Symbol name" }, direction: { type: "string", description: "upstream, downstream, or both" }, max_depth: { type: "number", description: "Max BFS depth (default: 3)" }, include_tests: { type: "boolean", description: "Include tests (default: false)" } }, required: ["symbol"] } },
       { name: "graph_outline", description: "Compressed file outline: signatures, decorators, docstrings.", inputSchema: { type: "object" as const, properties: { file_path: { type: "string", description: "Relative file path" }, format: { type: "string", description: "markdown or json" } }, required: ["file_path"] } },
@@ -241,13 +279,25 @@ export async function startMcpServer(options: McpServerOptions = {}): Promise<vo
       { name: "graph_context", description: "Smart context builder — returns token-budgeted, relevance-ranked context for any query. Combines text search, vector similarity, graph expansion, and community summaries.", inputSchema: { type: "object" as const, properties: { query: { type: "string", description: "Natural language query or code reference" }, max_tokens: { type: "number", description: "Token budget (default: 4096)" }, scope: { type: "string", description: "Repo name or path prefix filter" }, include_source: { type: "boolean", description: "Include source code snippets (default: false)" }, format: { type: "string", description: "Output format: 'narrative' (markdown) or 'structured' (JSON). Default: narrative" } }, required: ["query"] } },
       { name: "graph_docs", description: "Search documentation nodes (markdown, text, rst) with linked code references.", inputSchema: { type: "object" as const, properties: { query: { type: "string", description: "Search text" }, top_k: { type: "number", description: "Max results (default: 10)" }, repo: { type: "string", description: "Filter by repo" } }, required: ["query"] } },
       { name: "graph_status", description: "Graph status: metadata, counts, repos.", inputSchema: { type: "object" as const, properties: {} } },
+      ].map((t) => ({ ...t, inputSchema: { ...t.inputSchema, properties: { ...t.inputSchema.properties, graph: GRAPH_ARG } } })),
     ],
   }));
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
+  // ponytail: tool calls run one at a time so switching graphs never closes a db mid-call;
+  // per-graph resource cache if parallel cross-graph calls get slow.
+  let callQueue: Promise<unknown> = Promise.resolve();
+  server.setRequestHandler(CallToolRequestSchema, (request) => {
+    const run = callQueue.then(() => callTool(request.params));
+    callQueue = run.catch(() => {});
+    return run;
+  });
+
+  const callTool = async (params: { name: string; arguments?: Record<string, unknown> }) => {
+    const { name, arguments: args } = params;
     try {
-      const { db, graphDir: gDir, graphJsonPath: gjPath, resolvePaths: rp } = await resourceManager.getResources();
+      if (name === "graph_list") return listGraphs(resourceManager);
+      const graph = (args as Record<string, unknown> | undefined)?.graph as string | undefined;
+      const { db, graphDir: gDir, graphJsonPath: gjPath, resolvePaths: rp } = await resourceManager.getResources(graph);
 
       switch (name) {
         case "graph_search": {
@@ -299,7 +349,7 @@ export async function startMcpServer(options: McpServerOptions = {}): Promise<vo
     } catch (error) {
       return { content: [{ type: "text", text: `Error: ${errorMessage(error)}` }], isError: true };
     }
-  });
+  };
 
   server.setRequestHandler(ListResourcesRequestSchema, async () => ({
     resources: [{ uri: "graph://status", name: "Graph Status", description: "Current graph metadata", mimeType: "text/plain" }],
