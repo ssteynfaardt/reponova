@@ -123,6 +123,8 @@ export function addHubGraph(
 
   const base = names ? getHubGraph(names.base) : null;
   if (opts.ifRegistered && !base) return null;
+  // `worktrees: false` in the main graph's config: worktrees use the main graph unless added by hand.
+  if (opts.ifRegistered && base && name !== base.name && readConfig(base.configPath).worktrees === false) return null;
 
   const templatePath = opts.from ? resolve(opts.from) : base?.configPath ?? join(hubDir(), "template.yml");
   const template = existsSync(templatePath) ? readConfig(templatePath) : FALLBACK_TEMPLATE;
@@ -166,15 +168,26 @@ export function pruneHubGraphs(): string[] {
   return gone.map((g) => g.name);
 }
 
-// ponytail: mkdir lock, stale after 30 min; per-graph only — two different graphs build in parallel.
-const LOCK_STALE_MS = 30 * 60 * 1000;
+// ponytail: mkdir lock holding the builder's pid; per-graph only — two different graphs build in parallel.
+function lockHolderAlive(lock: string): boolean {
+  const pidFile = join(lock, "pid");
+  // Lock just created, pid not written yet.
+  if (!existsSync(pidFile)) return Date.now() - statSync(lock).mtimeMs < 60_000;
+  try {
+    process.kill(Number(readFileSync(pidFile, "utf-8")), 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
 
-/** Run fn holding the graph's build lock. Returns false (without running) if another build holds it. */
+/** Run fn holding the graph's build lock. Returns false (without running) if a live build holds it. */
 export async function withBuildLock(g: HubGraph, fn: () => Promise<void>): Promise<boolean> {
   const lock = join(g.dir, ".build.lock");
   try {
-    if (existsSync(lock) && Date.now() - statSync(lock).mtimeMs > LOCK_STALE_MS) rmSync(lock, { recursive: true, force: true });
+    if (existsSync(lock) && !lockHolderAlive(lock)) rmSync(lock, { recursive: true, force: true });
     mkdirSync(lock);
+    writeFileSync(join(lock, "pid"), String(process.pid));
   } catch {
     return false;
   }

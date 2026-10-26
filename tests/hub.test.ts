@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { parse as parseYaml } from "yaml";
@@ -14,6 +14,7 @@ import {
   graphForCwd,
   importHubGraph,
   pruneHubGraphs,
+  withBuildLock,
 } from "../src/shared/hub.js";
 
 const git = (cwd: string, ...args: string[]) =>
@@ -66,6 +67,27 @@ describe("graph hub", () => {
     expect(cfg.plugins).toEqual({ go: { enabled: true } });
     expect(cfg.repos).toEqual([{ name: "myrepo", path: wt }]);
     expect(g.outputDir).toBe(join(tmp, "hub", "myrepo@feat-x", "reponova-out"));
+  });
+
+  it("worktrees: false keeps --if-registered from creating worktree graphs (manual add still works)", () => {
+    writeFileSync(join(tmp, "base.yml"), "worktrees: false\n");
+    addHubGraph(repo, { from: join(tmp, "base.yml") });
+    expect(addHubGraph(repo, { ifRegistered: true })!.name).toBe("myrepo");
+    expect(addHubGraph(wt, { ifRegistered: true })).toBeNull();
+    expect(addHubGraph(wt)!.name).toBe("myrepo@feat-x");
+  });
+
+  it("build lock: skips while holder alive, reclaims a dead holder's lock", async () => {
+    const g = addHubGraph(repo)!;
+    const lock = join(g.dir, ".build.lock");
+    mkdirSync(lock);
+    writeFileSync(join(lock, "pid"), String(process.pid));
+    let ran = false;
+    expect(await withBuildLock(g, async () => { ran = true; })).toBe(false);
+    writeFileSync(join(lock, "pid"), "999999"); // no such process
+    expect(await withBuildLock(g, async () => { ran = true; })).toBe(true);
+    expect(ran).toBe(true);
+    expect(existsSync(lock)).toBe(false);
   });
 
   it("cwd default: worktree graph, falling back to the main checkout's graph", () => {
